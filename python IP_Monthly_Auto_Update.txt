@@ -1,0 +1,433 @@
+import sys
+import time
+import traceback
+import os
+import warnings
+
+# ================= 核心防闪退机制 =================
+def pause_exit(message=None):
+    if message:
+        print("\n" + "!"*50)
+        print(message)
+        print("!"*50 + "\n")
+    print("\n程序已停止。请按 【回车键 (Enter)】 退出窗口...")
+    try:
+        if sys.version_info[0] < 3:
+            raw_input()
+        else:
+            input()
+    except:
+        pass
+    sys.exit()
+
+# ================= 1. 安全导入依赖库 =================
+print("正在检查环境依赖...")
+try:
+    import pandas as pd
+    import openpyxl
+    from openpyxl.styles import Font
+    from datetime import datetime
+    import re
+    import difflib
+    warnings.simplefilter("ignore") 
+except ImportError as e:
+    pause_exit(f"【环境错误】缺少必要的库: {e.name}\n请运行: pip install pandas openpyxl xlrd")
+except Exception as e:
+    pause_exit(f"【未知导入错误】\n{traceback.format_exc()}")
+
+print("环境检查通过！正在启动脚本...")
+
+# ================= 配置区域 =================
+TARGET_KEYWORD = "2026 IP MONTHLY" # 目标文件关键词
+
+# 平台关键词映射
+PLATFORM_KEYWORDS = {
+    '芒果': '芒果', '腾讯': '腾讯', '爱奇艺': '爱奇艺', '优酷': '优酷',
+    'YOUKU': '优酷', 'IQIYI': '爱奇艺', 'TENCENT': '腾讯', 'MANGO': '芒果'
+}
+
+# 字段映射表
+COLUMN_MAPPING = {
+    '上线日期': ['上线日期', '播出规划', '上线时间', '上线档期', '播出时间', '首播时间', '预计上线', '排播规划', '定档日期', '播出日期'],
+    '拍摄进度': ['拍摄进度', '录制规划', '录制时间', '拍摄档期', '制作进度', '开机时间', '杀青时间', '录制情况'],
+    '预估总VV数': ['预估总VV数', '预估VV', '节目专辑预估流量', '流量预估', 'VV预估', '热度预估', '播放量预估'],
+    '拟邀明星阵容': ['拟邀明星阵容', '嘉宾阵容', '艺人阵容', '拟邀嘉宾', '明星阵容', '已确定明星阵容', '拟邀艺人', '常驻嘉宾', '拟邀常驻'],
+    '媒体内部定级': ['媒体内部定级', '营销定级', 'Level', '定级', '评级', '项目等级', 'S/A/B', '媒体\n内部定级'],
+    '节目简介': ['节目简介', '项目简介', '剧情简介', '内容简介', '看点', '亮点', '节目概述'],
+    '制作方': ['制作方', '制作团队', '制作公司', '工作室', '承制方']
+}
+
+# 源文件中识别状态列的关键词 (用于新增列表过滤)
+SOURCE_STATUS_KEYWORDS = ['Status', 'STATUS', 'status', '播出状态', '状态', '播出情况', '项目进度']
+
+# 中文数字映射
+CN_NUM_MAP = {
+    '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+    '六': '6', '七': '7', '八': '8', '九': '9', '十': '10'
+}
+
+# ================= 工具函数 =================
+
+def identify_platform(filename):
+    """根据文件名识别平台"""
+    filename_upper = filename.upper()
+    for key, plat in PLATFORM_KEYWORDS.items():
+        if key in filename_upper:
+            return plat
+    return "未知平台"
+
+def normalize_ip_for_matching(name):
+    """
+    IP归一化（仅用于匹配）：
+    1. 去除书名号、符号、空格
+    2. 去除 '第'、'季'
+    3. 将中文数字 一到十 转为阿拉伯数字
+    """
+    if not isinstance(name, str):
+        return str(name)
+    name = str(name).strip()
+    name = re.sub(r'《|》|\[.*?\]|\(.*?\)|（.*?）', '', name)
+    name = re.sub(r'\s+|·|：|:', '', name) 
+    name = name.replace('第', '').replace('季', '')
+    for cn, ar in CN_NUM_MAP.items():
+        name = name.replace(cn, ar)
+    return name
+
+def format_ip_display(name):
+    """IP显示格式化：补充书名号"""
+    if not isinstance(name, str) or not name:
+        return name
+    name = name.strip()
+    if not name.startswith('《'):
+        name = '《' + name
+    if not name.endswith('》'):
+        name = name + '》'
+    return name
+
+def clean_year_info(text):
+    """清洗年份信息"""
+    if not isinstance(text, str):
+        return text
+    text = re.sub(r'2026年|26年|2026|26', '', text)
+    return text
+
+def check_platform_match(target_plat_cell_val, source_plat):
+    """检查平台是否匹配"""
+    if source_plat == "未知平台": return True
+    if not target_plat_cell_val: return True
+    target_str = str(target_plat_cell_val).strip()
+    if source_plat in target_str or target_str in source_plat: return True
+    if source_plat == '芒果' and ('湖南' in target_str or '芒果' in target_str): return True
+    return False
+
+def parse_end_date(date_str):
+    if not isinstance(date_str, str): return None
+    date_patterns = re.findall(r'(\d{1,2})[月\.](\d{1,2})', date_str)
+    if not date_patterns: return None
+    month, day = date_patterns[-1]
+    try:
+        current_year = datetime.now().year
+        year = current_year
+        if len(date_patterns) > 1:
+            start_m = int(date_patterns[0][0])
+            end_m = int(month)
+            if start_m > 9 and end_m < 3: year += 1 
+        return datetime(year, int(month), int(day))
+    except: return None
+
+def find_header_row_pandas(file_path, sheet_name, keywords, check_rows=20):
+    try:
+        df_temp = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=check_rows)
+        for i, row in df_temp.iterrows():
+            row_str = row.astype(str).values
+            if any(k in s for s in row_str for k in keywords):
+                return i
+        return None
+    except: return None
+
+def find_header_row_openpyxl(ws, keywords, check_rows=20):
+    for r in range(1, check_rows + 1):
+        row_values = [str(cell.value).strip() if cell.value else '' for cell in ws[r]]
+        if any(k in val for val in row_values for k in keywords):
+            return r
+    return None
+
+def find_target_file():
+    files = os.listdir('.')
+    target_files = []
+    for f in files:
+        if f.startswith('~$') or not f.endswith('.xlsx') or '_Updated' in f or '新增list' in f: continue
+        if TARGET_KEYWORD in f.upper(): target_files.append(f)
+    return target_files[0] if target_files else None
+
+def get_source_files(exclude_target):
+    all_files = os.listdir('.')
+    source_files = []
+    for f in all_files:
+        if not f.endswith('.xlsx') or f.startswith('~$') or f == exclude_target or '_Updated' in f or '新增list' in f: continue
+        source_files.append(f)
+    return source_files
+
+def get_unique_output_filename(base_name):
+    if base_name.lower().endswith('.xlsx'): base_no_ext = base_name[:-5]
+    else: base_no_ext = base_name
+    output_filename = f"{base_no_ext}_Updated.xlsx"
+    counter = 2
+    while os.path.exists(output_filename):
+        output_filename = f"{base_no_ext}_Updated_v{counter}.xlsx"
+        counter += 1
+    return output_filename
+
+def apply_format(cell, is_ip_col=False):
+    """应用字体格式：微软雅黑, 10号, IP加粗"""
+    try:
+        current_font = cell.font
+        new_font = Font(
+            name='Microsoft YaHei', 
+            size=10,
+            bold=True if is_ip_col else False,
+            color=current_font.color,
+            strike=current_font.strike,
+            underline=current_font.underline,
+            italic=current_font.italic
+        )
+        cell.font = new_font
+    except: pass
+
+# ================= 主逻辑 =================
+
+def main():
+    print("="*60)
+    print("  IP Monthly 智能更新脚本 V4.1 (新增列表过滤版)")
+    print("  更新：新增列表仅包含【在播/待播】项目，自动剔除完结/取消项目")
+    print("="*60)
+    
+    # 1. 锁定文件
+    target_file = find_target_file()
+    if not target_file: pause_exit(f"[错误] 找不到文件名包含 '{TARGET_KEYWORD}' 的文件。")
+    print(f">> ✅ 目标文件: [{target_file}]")
+    
+    source_files = get_source_files(target_file)
+    if not source_files: pause_exit(f"[警告] 没有找到源数据文件。")
+    print(f">> 发现 {len(source_files)} 个源文件")
+
+    # 2. 读取源数据
+    print("\n>> 正在合并源数据...")
+    all_source_df = pd.DataFrame()
+    
+    for src_file in source_files:
+        platform_tag = identify_platform(src_file)
+        try:
+            xls = pd.ExcelFile(src_file)
+            for sheet in xls.sheet_names:
+                header_row = find_header_row_pandas(src_file, sheet, ['名称', '项目名称', '节目名称', 'IP名称'])
+                if header_row is not None:
+                    df = pd.read_excel(src_file, sheet_name=sheet, header=header_row)
+                    df.columns = df.columns.astype(str).str.strip().str.replace('\n', '')
+                    ip_col = next((col for col in df.columns if '名称' in col), None)
+                    if ip_col:
+                        df['原始IP名称'] = df[ip_col].astype(str).str.strip()
+                        df['Match_IP'] = df['原始IP名称'].apply(normalize_ip_for_matching)
+                        df['来源文件'] = src_file
+                        df['来源平台'] = platform_tag 
+                        all_source_df = pd.concat([all_source_df, df], ignore_index=True)
+        except Exception as e:
+            print(f"   [X] 读取 {src_file} 失败: {e}")
+
+    if all_source_df.empty: pause_exit("[严重错误] 未读取到任何有效数据。")
+
+    # 3. 建立源数据索引
+    print("\n>> 正在构建智能匹配索引...")
+    source_index_map = {} 
+    for idx, row in all_source_df.iterrows():
+        match_key = row['Match_IP']
+        if match_key:
+            source_index_map[match_key] = row
+    print(f"   [索引构建完毕] 有效源IP数量: {len(source_index_map)}")
+
+    # 4. 处理目标文件
+    print("-" * 50)
+    print(">> 正在扫描目标文件...")
+    
+    try:
+        wb = openpyxl.load_workbook(target_file)
+        target_ws = None
+        target_header_row = None
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            h_row = find_header_row_openpyxl(ws, ['IP名称', 'Status'], check_rows=10)
+            if h_row:
+                target_ws = ws; target_header_row = h_row
+                break
+        if not target_ws: target_ws = wb.active; target_header_row = 6
+
+        red_font = Font(name='Microsoft YaHei', size=10, color="FF0000")
+        
+        col_map = {}
+        ip_col = status_col = date_col = plat_col = None
+        
+        for col in range(1, target_ws.max_column + 1):
+            val = target_ws.cell(row=target_header_row, column=col).value
+            apply_format(target_ws.cell(row=target_header_row, column=col), is_ip_col=False)
+            
+            if val:
+                h_name = str(val).strip().replace('\n', '')
+                col_map[col] = h_name
+                if 'IP名称' in h_name: ip_col = col
+                if 'Status' in h_name or '播出状态' in h_name: status_col = col
+                if '上线日期' in h_name: date_col = col
+                if '平台' in h_name or '播出平台' in h_name: plat_col = col
+        
+        if not ip_col: pause_exit("[错误] 没找到 'IP名称' 列")
+        
+        matched_source_keys = set()
+        max_row = target_ws.max_row
+        today = datetime.now()
+        update_count = 0
+        
+        for row in range(target_header_row + 1, max_row + 1):
+            for c in range(1, target_ws.max_column + 1):
+                cell = target_ws.cell(row=row, column=c)
+                apply_format(cell, is_ip_col=(c == ip_col))
+
+            ip_cell = target_ws.cell(row=row, column=ip_col)
+            ip_val = ip_cell.value
+            status_cell = target_ws.cell(row=row, column=status_col) if status_col else None
+            status = str(status_cell.value).strip() if status_cell and status_cell.value else ""
+            
+            raw_ip = str(ip_val).strip() if ip_val else ""
+            if not raw_ip or raw_ip == 'None': continue
+
+            formatted_ip = format_ip_display(raw_ip)
+            if formatted_ip != raw_ip:
+                ip_cell.value = formatted_ip
+                raw_ip = formatted_ip
+
+            if status == "完结": continue
+            
+            if status == "在播" and date_col:
+                d_cell = target_ws.cell(row=row, column=date_col)
+                d_val = str(d_cell.value)
+                e_date = parse_end_date(d_val)
+                if e_date and today > e_date:
+                    if status_cell:
+                        status_cell.value = "完结"
+                        status_cell.font = Font(name='Microsoft YaHei', size=10, color="FF0000")
+                        update_count += 1
+            
+            elif status in ["待播", "其他", "None", "", "None"] or status is None:
+                target_match_key = normalize_ip_for_matching(raw_ip)
+                matched_row = None
+                
+                if target_match_key in source_index_map:
+                    matched_row = source_index_map[target_match_key]
+                else:
+                    matches = difflib.get_close_matches(target_match_key, list(source_index_map.keys()), n=1, cutoff=0.75)
+                    if matches:
+                        matched_row = source_index_map[matches[0]]
+                
+                if matched_row is not None:
+                    matched_source_keys.add(matched_row['Match_IP'])
+                    target_plat_val = target_ws.cell(row=row, column=plat_col).value if plat_col else None
+                    source_plat_tag = matched_row['来源平台']
+                    
+                    if not check_platform_match(target_plat_val, source_plat_tag): continue
+
+                    for t_col, t_name in col_map.items():
+                        if t_col in [ip_col, status_col]: continue
+                        if t_name not in COLUMN_MAPPING: continue
+                        if source_plat_tag == '优酷' and ('内部定级' in t_name or 'Level' in t_name): continue
+
+                        possible_srcs = COLUMN_MAPPING[t_name]
+                        val_write = None
+                        for s_name in possible_srcs:
+                            if s_name in matched_row and pd.notna(matched_row[s_name]) and str(matched_row[s_name]).strip() != "":
+                                val_write = str(matched_row[s_name])
+                                break
+                        
+                        if val_write is not None:
+                            if '日期' in t_name or '进度' in t_name or '时间' in t_name:
+                                val_write = clean_year_info(val_write)
+                            
+                            curr_cell = target_ws.cell(row=row, column=t_col)
+                            curr_val_str = str(curr_cell.value).strip() if curr_cell.value else ""
+                            curr_val_cleaned = clean_year_info(curr_val_str) if ('日期' in t_name or '进度' in t_name) else curr_val_str
+                            
+                            if val_write.strip() != curr_val_cleaned:
+                                curr_cell.value = val_write
+                                curr_cell.font = Font(name='Microsoft YaHei', size=10, color="FF0000")
+                                update_count += 1
+
+        out_file = get_unique_output_filename(target_file)
+        wb.save(out_file)
+        print(f"   - 成功更新单元格: {update_count}")
+        print(f"   - 结果文件: [{out_file}]")
+
+        # 5. 生成新增列表 (New List)
+        print("-" * 50)
+        print(">> 正在生成【新增list】...")
+        
+        new_items = []
+        for src_key, row_data in source_index_map.items():
+            if src_key not in matched_source_keys:
+                # ====== V4.1 核心：新增项状态过滤 ======
+                found_status_val = None
+                for col_name in row_data.index:
+                    if any(k in str(col_name) for k in SOURCE_STATUS_KEYWORDS):
+                        found_status_val = str(row_data[col_name]).strip()
+                        break
+                
+                # 只有状态包含 "在播" 或 "待播" 且不为空时，才添加
+                # 如果没找到状态列(found_status_val is None)，默认保留，防止误删
+                should_add = True
+                if found_status_val:
+                    if "在播" in found_status_val or "待播" in found_status_val:
+                        should_add = True
+                    else:
+                        should_add = False # 是完结、取消等其他状态，跳过
+                
+                if should_add:
+                    new_items.append(row_data)
+
+        if new_items:
+            print(f"   发现 {len(new_items)} 个潜在新增IP (已过滤非在播/待播项)。")
+            new_df = pd.DataFrame(new_items)
+            wb_new = openpyxl.Workbook()
+            ws_new = wb_new.active
+            ws_new.title = "新增IP列表"
+            
+            sorted_cols = sorted(col_map.items()) 
+            for col_idx, col_name in sorted_cols:
+                ws_new.cell(row=1, column=col_idx).value = col_name
+            
+            write_row = 2
+            for _, src_row in new_df.iterrows():
+                for col_idx, col_name in sorted_cols:
+                    val_to_fill = ""
+                    if 'IP名称' in col_name:
+                        val_to_fill = format_ip_display(src_row['原始IP名称'])
+                    elif '平台' in col_name and '播出平台' not in col_name:
+                         val_to_fill = src_row['来源平台']
+                    elif col_name in COLUMN_MAPPING:
+                        possible_srcs = COLUMN_MAPPING[col_name]
+                        for s_name in possible_srcs:
+                            if s_name in src_row and pd.notna(src_row[s_name]) and str(src_row[s_name]).strip() != "":
+                                raw_val = str(src_row[s_name])
+                                if '日期' in col_name or '进度' in col_name:
+                                    raw_val = clean_year_info(raw_val)
+                                val_to_fill = raw_val
+                                break
+                    ws_new.cell(row=write_row, column=col_idx).value = val_to_fill
+                write_row += 1
+            
+            wb_new.save("【新增list】.xlsx")
+            print(f"   - 新增列表已保存为: [【新增list】.xlsx]")
+        else:
+            print(f"   - 没有发现符合条件的新增IP。")
+
+    except Exception as e:
+        pause_exit(f"【运行时错误】\n{traceback.format_exc()}")
+
+if __name__ == "__main__":
+    main()
+    pause_exit()
